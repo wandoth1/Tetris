@@ -1,0 +1,9 @@
+/target/
+/dist/
+/soundtrack/
+/build-metadata/
+*.app/
+.DS_Store
+*.log
+core-tests
+__pycache__/

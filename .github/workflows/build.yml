@@ -1,0 +1,188 @@
+name: Build, test and package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
+
+jobs:
+  verify:
+    name: Engine, persistence and synthesizer tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup default stable
+      - name: Resolve shared dependency lock
+        run: |
+          if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+          mkdir -p build-metadata
+          cp Cargo.lock build-metadata/
+      - name: Core tests without graphics or audio devices
+        run: cargo test --locked --no-default-features --lib 2>&1 | tee build-metadata/core-tests.txt
+      - name: Rust formatting and lints
+        run: |
+          cargo fmt --all
+          cargo clippy --locked --no-default-features --all-targets
+      - name: Export original soundtrack
+        run: |
+          cargo run --locked --release --no-default-features --bin soundtrack -- soundtrack
+          cp LICENSE soundtrack/
+          python3 -c "import shutil; shutil.make_archive('NeonPulse-Soundtrack', 'zip', 'soundtrack')"
+      - name: Preserve normalized source and exact dependencies
+        run: |
+          python3 - <<'PY'
+          import pathlib, zipfile
+          root = pathlib.Path('.')
+          with zipfile.ZipFile('build-metadata/NeonPulse-Source.zip', 'w', zipfile.ZIP_DEFLATED) as out:
+              for item in ['src', 'scripts', '.github', '.cargo', 'Cargo.toml', 'Cargo.lock', 'build.rs', 'README.md', 'LICENSE', '.gitignore', '.gitattributes']:
+                  p = root / item
+                  for f in ([p] if p.is_file() else p.rglob('*')):
+                      if f.is_file(): out.write(f, f)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata
+          path: build-metadata/
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-soundtrack
+          path: NeonPulse-Soundtrack.zip
+          retention-days: 30
+
+  desktop:
+    name: ${{ matrix.platform }} native build and tests
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            platform: Windows-x64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            platform: macOS-AppleSilicon
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macOS-Intel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-metadata
+          path: build-metadata
+      - name: Use shared lock
+        shell: bash
+        run: cp build-metadata/Cargo.lock Cargo.lock
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: Native core tests
+        run: cargo test --locked --no-default-features --lib --target ${{ matrix.target }}
+      - name: Build game with embedded soundtrack
+        run: cargo build --locked --release --bin tetris --target ${{ matrix.target }}
+      - name: Package native application
+        run: python scripts/package.py --target ${{ matrix.target }} --platform ${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  render:
+    name: Real GPU renderer smoke test (Linux)
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-metadata
+          path: build-metadata
+      - name: Install display libraries
+        run: sudo apt-get update && sudo apt-get install -y xvfb libgl1-mesa-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libasound2-dev
+      - run: rustup default stable
+      - name: Build without sound device requirement
+        run: |
+          cp build-metadata/Cargo.lock Cargo.lock
+          cargo build --locked --release --no-default-features --features desktop --bin tetris
+      - name: Open window, render and close cleanly
+        run: |
+          mkdir -p render-check
+          LIBGL_ALWAYS_SOFTWARE=1 timeout 30s xvfb-run -a -s '-screen 0 1280x900x24' target/release/tetris --smoke-test --screenshot render-check/gameplay.png
+          test -s render-check/gameplay.png
+      - uses: actions/upload-artifact@v4
+        with:
+          name: render-check
+          path: render-check/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish verified downloads
+    if: github.event_name != 'pull_request'
+    needs: [verify, desktop, render]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-files
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: render-check
+          path: release-files
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-metadata
+          path: build-metadata
+      - name: Metadata and checksums
+        run: |
+          cp build-metadata/NeonPulse-Source.zip release-files/
+          cp build-metadata/Cargo.lock release-files/
+          cp build-metadata/core-tests.txt release-files/
+          cd release-files
+          sha256sum *.zip > SHA256SUMS.txt
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+            gh release create "$tag" --title "Neon Pulse $tag" --generate-notes --verify-tag
+          else
+            tag="development"
+            if ! gh release view "$tag" >/dev/null 2>&1; then
+              gh release create "$tag" --target "$GITHUB_SHA" --title "Neon Pulse — development build" --notes "Windows x64 and macOS Intel/Apple Silicon. Native core tests and Linux renderer smoke test. Unsigned Windows executable; ad-hoc signed, non-notarized Mac app." --prerelease
+            fi
+            gh release edit "$tag" --notes "Built from commit $GITHUB_SHA. Native core tests and Linux renderer smoke test passed. Windows x64 and macOS Intel/Apple Silicon; original soundtrack included. Windows executable has no commercial certificate; Mac app is ad-hoc signed, not notarized. See README for controls and installation."
+          fi
+          gh release upload "$tag" release-files/* --clobber

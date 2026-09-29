@@ -1,0 +1,39 @@
+[package]
+name = "tetris-neon-pulse"
+version = "0.1.0"
+edition = "2021"
+authors = ["wandoth1"]
+description = "A neon falling-block game with an original synthesized soundtrack"
+license = "MIT"
+default-run = "tetris"
+build = "build.rs"
+
+[lib]
+name = "tetris_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tetris"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "soundtrack"
+path = "src/bin/soundtrack.rs"
+
+[features]
+default = ["desktop", "sound"]
+desktop = ["dep:macroquad"]
+sound = ["desktop", "macroquad/audio"]
+
+[dependencies]
+macroquad = { version = "=0.4.15", optional = true, default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2
