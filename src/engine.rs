@@ -130,7 +130,7 @@ impl Game {
     }
     pub fn lock_fraction(&self) -> f32 { (self.lock_time / LOCK_DELAY).clamp(0.0, 1.0) as f32 }
     pub fn interval(&self) -> f64 {
-        match self.mode { Mode::Zen => f64::INFINITY, Mode::Sprint => 0.8,
+        match self.mode { Mode::Zen => 1.0, Mode::Sprint => 0.8,
             Mode::Marathon => (0.8 * 0.78_f64.powi((self.level.min(30) - 1) as i32)).max(0.035) }
     }
     fn reset_after_action(&mut self, was_grounded: bool) {
@@ -315,7 +315,8 @@ mod tests {
     #[test] fn hold_resets_orientation() { let mut g = game(); g.held = Some(Kind::T); g.hold(); assert_eq!(g.active, Piece::spawn(Kind::T)); }
     #[test] fn hold_swap_does_not_consume_queue() { let mut g = game(); g.held = Some(Kind::T); let before: Vec<_> = g.next_pieces().collect(); g.hold(); assert_eq!(before, g.next_pieces().collect::<Vec<_>>()); }
     #[test] fn gravity_advances_piece() { let mut g = game(); let y = g.active.y; for _ in 0..10 { g.tick(0.1); } assert!(g.active.y > y); }
-    #[test] fn zen_has_no_automatic_gravity() { let mut g = Game::new(Mode::Zen, 1); let p = g.active; for _ in 0..200 { g.tick(0.1); } assert_eq!(g.active, p); }
+    #[test] fn zen_has_slow_automatic_gravity() { let mut g = Game::new(Mode::Zen, 1); let y = g.active.y; for _ in 0..11 { g.tick(0.1); } assert!(g.active.y > y); }
+    #[test] fn zen_gravity_stays_constant() { let mut g = Game::new(Mode::Zen, 1); g.lines = 200; g.level = 30; assert_eq!(g.interval(), 1.0); }
     #[test] fn invalid_dt_does_not_corrupt_clock() { let mut g = game(); g.tick(f64::NAN); g.tick(f64::INFINITY); g.tick(-1.0); assert_eq!(g.elapsed, 0.0); }
     #[test] fn lock_delay_is_not_instant() { let mut g = game(); g.active = g.ghost(); g.tick(0.2); assert_eq!(g.pieces, 0); g.tick(0.2); g.tick(0.2); assert_eq!(g.pieces, 1); }
     #[test] fn lock_resets_are_bounded() { let mut g = Game::new(Mode::Zen, 1); g.active = Piece::spawn(Kind::O); g.active = g.ghost(); for i in 0..100 { if g.pieces > 0 { break; } g.shift(if i % 2 == 0 { -1 } else { 1 }); g.tick(0.05); } assert_eq!(g.pieces, 1); }
