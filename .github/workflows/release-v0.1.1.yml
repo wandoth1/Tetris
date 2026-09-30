@@ -1,0 +1,153 @@
+name: Publish Neon Pulse v0.1.1
+
+# Promote the exact binaries already tested on their native platforms.
+# This workflow never rebuilds or substitutes artifacts from another commit.
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/release-v0.1.1.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release-neon-pulse-v0.1.1
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BUILD_RUN: '36718077854'
+      SOURCE_SHA: 'ceb8f989c5a4c2b73ec8454eb1319407d2b8a632'
+      RELEASE_TAG: 'v0.1.1'
+    steps:
+      - name: Verify build provenance and successful jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN" > run.json
+          jq -e --arg sha "$SOURCE_SHA" --arg repo "$GH_REPO" '
+            .head_sha == $sha and .status == "completed" and
+            .conclusion == "success" and .event == "push" and
+            .head_branch == "main" and .head_repository.full_name == $repo
+          ' run.json
+          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN/jobs?per_page=100" > jobs.json
+          jq -e '
+            [.jobs[] | select(
+              .name == "Engine, persistence and synthesizer tests" or
+              .name == "Windows-x64 native build and tests" or
+              .name == "macOS-Intel native build and tests" or
+              .name == "macOS-AppleSilicon native build and tests" or
+              .name == "Real GPU renderer smoke test (Linux)"
+            )] | length == 5 and all(.[]; .conclusion == "success")
+          ' jobs.json
+
+      - name: Retrieve original build artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-files build-metadata
+          for artifact in release-Windows-x64 release-macOS-AppleSilicon release-macOS-Intel release-soundtrack; do
+            gh run download "$BUILD_RUN" --name "$artifact" --dir release-files
+          done
+          gh run download "$BUILD_RUN" --name render-check --dir release-files
+          gh run download "$BUILD_RUN" --name build-metadata --dir build-metadata
+          cp build-metadata/Cargo.lock release-files/
+          cp build-metadata/core-tests.txt release-files/
+          cp build-metadata/NeonPulse-Source.zip release-files/
+
+      - name: Validate archive contents and generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, struct, zipfile
+          from pathlib import Path
+          root = Path('release-files')
+          specs = {
+              'Windows-x64': ('Tetris.exe', 0x8664),
+              'macOS-AppleSilicon': ('Tetris Neon Pulse.app/Contents/MacOS/tetris', 0x0100000c),
+              'macOS-Intel': ('Tetris Neon Pulse.app/Contents/MacOS/tetris', 0x01000007),
+          }
+          for platform, (entry, expected) in specs.items():
+              path = root / f'Tetris-NeonPulse-{platform}.zip'
+              with zipfile.ZipFile(path) as z:
+                  assert z.testzip() is None, f'Corrupt ZIP: {path}'
+                  assert os.environ['SOURCE_SHA'] in z.read('BUILD.txt').decode(), 'Unexpected source commit'
+                  binary = z.read(entry)
+                  if platform == 'Windows-x64':
+                      assert binary[:2] == b'MZ'
+                      pe = struct.unpack_from('<I', binary, 0x3c)[0]
+                      assert binary[pe:pe+4] == b'PE\0\0'
+                      assert struct.unpack_from('<H', binary, pe+4)[0] == expected
+                  else:
+                      assert binary[:4] == b'\xcf\xfa\xed\xfe'
+                      assert struct.unpack_from('<I', binary, 4)[0] == expected
+                      assert (z.getinfo(entry).external_attr >> 16) & 0o111, 'Missing execute bits'
+                      assert any('/_CodeSignature/' in n for n in z.namelist()), 'Missing app signature'
+                  print(f'{path.name}: verified architecture, ZIP integrity and source commit')
+          assert (root / 'NeonPulse-Soundtrack.zip').is_file()
+          PY
+          printf 'Version: %s\nSource commit: %s\nBuild run: https://github.com/%s/actions/runs/%s\n' "$RELEASE_TAG" "$SOURCE_SHA" "$GH_REPO" "$BUILD_RUN" > release-files/BUILD-PROVENANCE.txt
+          (cd release-files && sha256sum *.zip > SHA256SUMS.txt)
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > notes.md <<'NOTES'
+          ## Tetris · Neon Pulse v0.1.1
+
+          Versión de mantenimiento que corrige el comportamiento del modo Zen.
+
+          ### Corrección principal
+
+          - El modo **Zen ahora tiene gravedad automática lenta y constante**.
+          - Las piezas bajan automáticamente aproximadamente una casilla por segundo.
+          - La velocidad de Zen no aumenta con el nivel ni con el tiempo.
+          - La caída suave manual con flecha abajo / S sigue funcionando.
+          - Se añadieron pruebas de regresión para comprobar que la gravedad de Zen existe y permanece constante.
+
+          ### Descargar
+
+          | Tu equipo | Paquete |
+          | --- | --- |
+          | Windows 10/11 de 64 bits | **Tetris-NeonPulse-Windows-x64.zip** |
+          | Mac con Apple Silicon | **Tetris-NeonPulse-macOS-AppleSilicon.zip** |
+          | Mac con procesador Intel | **Tetris-NeonPulse-macOS-Intel.zip** |
+
+          **Windows:** extrae el ZIP y abre `Tetris.exe`.
+          **macOS:** extrae el ZIP y mueve `Tetris Neon Pulse.app` a Aplicaciones.
+          No necesitas instalar Rust. La música está incluida en el juego.
+
+          ### Verificaciones
+
+          Pruebas del motor superadas, incluida la nueva regresión del modo Zen.
+          Compilación y empaquetado nativos correctos para Windows x64, macOS ARM64 y macOS x86-64.
+          Prueba de apertura, renderizado y cierre superada bajo Linux/Xvfb.
+          Los paquetes se publican exactamente desde el build validado del commit `ceb8f989c5a4c2b73ec8454eb1319407d2b8a632`.
+
+          Consulta `SHA256SUMS.txt` y `BUILD-PROVENANCE.txt` para verificar los archivos.
+
+          **Avisos de instalación:** el ejecutable de Windows no dispone de certificado comercial. Las aplicaciones de Mac tienen firma ad hoc, pero no notarización de Apple.
+
+          Código y música originales bajo licencia MIT. Proyecto independiente, sin afiliación con los responsables de Tetris.
+          NOTES
+
+      - name: Publish complete versioned release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --json isDraft >/dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          else
+            gh release create "$RELEASE_TAG" --target "$SOURCE_SHA" --title "Tetris · Neon Pulse v0.1.1" --notes-file notes.md --draft
+          fi
+          gh release upload "$RELEASE_TAG" release-files/* --clobber
+          gh release edit "$RELEASE_TAG" --notes-file notes.md --draft=false --prerelease=false --latest
+          gh release view "$RELEASE_TAG" --json url,isDraft,isPrerelease,assets
